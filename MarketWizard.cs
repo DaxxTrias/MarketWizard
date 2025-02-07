@@ -8,6 +8,7 @@ using ExileCore2.Shared.Helpers;
 using ImGuiNET;
 using MoreLinq;
 using Vector2 = System.Numerics.Vector2;
+using Vector4 = System.Numerics.Vector4;
 
 namespace MarketWizard;
 
@@ -15,10 +16,166 @@ public class MarketWizard : BaseSettingsPlugin<MarketWizardSettings>
 {
     private Func<BaseItemType, double> _getNinjaValue;
     private int _spread = 1;
+    
+    private DateTime _lastDivExRate = DateTime.MinValue;
+    private double _divExRate = 0;
+    private DateTime _lastChaosDivRate = DateTime.MinValue;
+    private double _chaosDivRate = 0;
+    private Dictionary<string, ItemPriceData> _itemPrices = new();
+    private Dictionary<string, Dictionary<string, CurrencyRatio>> _currencyRatios = new();
+    private DateTime _lastRatioUpdate = DateTime.MinValue;
+    private bool _showDivineInChaos = false;
+
+    private class ItemPriceData
+    {
+        public DateTime LastUpdate { get; set; }
+        public double PriceInDivine { get; set; }
+        public double PriceInExalted { get; set; }
+        public double PriceInChaos { get; set; }
+    }
+
+    private class CurrencyRatio
+    {
+        public DateTime LastUpdate { get; set; }
+        public double Ratio { get; set; }
+        public int Volume { get; set; }
+    }
 
     public override bool Initialise()
     {
         return true;
+    }
+
+    private void UpdateCurrencyRates(BaseItemType wanted, BaseItemType offered, float ratio)
+    {
+        if ((wanted.BaseName == "Divine Orb" && offered.BaseName == "Exalted Orb") ||
+            (wanted.BaseName == "Exalted Orb" && offered.BaseName == "Divine Orb"))
+        {
+            _lastDivExRate = DateTime.Now;
+            _divExRate = wanted.BaseName == "Divine Orb" ? ratio : 1 / ratio;
+        }
+
+        if ((wanted.BaseName == "Divine Orb" && offered.BaseName == "Chaos Orb") ||
+            (wanted.BaseName == "Chaos Orb" && offered.BaseName == "Divine Orb"))
+        {
+            _lastChaosDivRate = DateTime.Now;
+            _chaosDivRate = wanted.BaseName == "Divine Orb" ? ratio : 1 / ratio;
+        }
+    }
+
+    private void UpdateItemPrice(BaseItemType item, BaseItemType currency, float ratio)
+    {
+        if (item == null || currency == null) return;
+
+        var itemName = item.BaseName;
+        if (!_itemPrices.ContainsKey(itemName))
+        {
+            _itemPrices[itemName] = new ItemPriceData();
+        }
+
+        var priceData = _itemPrices[itemName];
+        priceData.LastUpdate = DateTime.Now;
+
+        switch (currency.BaseName)
+        {
+            case "Divine Orb":
+                priceData.PriceInDivine = ratio;
+                if (_divExRate > 0)
+                    priceData.PriceInExalted = ratio * _divExRate;
+                if (_chaosDivRate > 0)
+                    priceData.PriceInChaos = ratio * _chaosDivRate;
+                break;
+            case "Exalted Orb":
+                priceData.PriceInExalted = ratio;
+                if (_divExRate > 0)
+                {
+                    priceData.PriceInDivine = ratio / _divExRate;
+                    if (_chaosDivRate > 0)
+                        priceData.PriceInChaos = priceData.PriceInDivine * _chaosDivRate;
+                }
+                break;
+            case "Chaos Orb":
+                priceData.PriceInChaos = ratio;
+                if (_chaosDivRate > 0)
+                {
+                    priceData.PriceInDivine = ratio / _chaosDivRate;
+                    if (_divExRate > 0)
+                        priceData.PriceInExalted = priceData.PriceInDivine * _divExRate;
+                }
+                break;
+        }
+    }
+
+    private void UpdateCurrencyRatio(BaseItemType wanted, BaseItemType offered, float ratio, int volume)
+    {
+        if (wanted == null || offered == null) return;
+
+        if (!_currencyRatios.ContainsKey(wanted.BaseName))
+            _currencyRatios[wanted.BaseName] = new Dictionary<string, CurrencyRatio>();
+
+        _currencyRatios[wanted.BaseName][offered.BaseName] = new CurrencyRatio
+        {
+            LastUpdate = DateTime.Now,
+            Ratio = ratio,
+            Volume = volume
+        };
+
+        if (!_currencyRatios.ContainsKey(offered.BaseName))
+            _currencyRatios[offered.BaseName] = new Dictionary<string, CurrencyRatio>();
+
+        _currencyRatios[offered.BaseName][wanted.BaseName] = new CurrencyRatio
+        {
+            LastUpdate = DateTime.Now,
+            Ratio = 1 / ratio,
+            Volume = volume
+        };
+
+        _lastRatioUpdate = DateTime.Now;
+    }
+
+    private (double profitPercent, string betterCurrency) CalculatePriceProfit(ItemPriceData priceData)
+    {
+        if (priceData == null || _divExRate <= 0 || _chaosDivRate <= 0) 
+            return (0, "Unknown");
+
+        var divinePrice = priceData.PriceInDivine;
+        var exaltedPriceInDivine = priceData.PriceInExalted / _divExRate;
+        var chaosPriceInDivine = priceData.PriceInChaos / _chaosDivRate;
+
+        var prices = new[]
+        {
+            (Currency: "Divine", Price: divinePrice),
+            (Currency: "Exalted", Price: exaltedPriceInDivine),
+            (Currency: "Chaos", Price: chaosPriceInDivine)
+        };
+
+        var minPrice = prices.MinBy(x => x.Price);
+        var maxPrice = prices.MaxBy(x => x.Price);
+
+        var profitPercent = ((maxPrice.Price - minPrice.Price) / minPrice.Price) * 100;
+        
+        return profitPercent switch
+        {
+            > 0 => (Math.Abs(profitPercent), minPrice.Currency),
+            _ => (0, "Equal")
+        };
+    }
+
+    private (int profitAmount, string buyCurrency) CalculateCurrencyProfit(string currencyName)
+    {
+        if (!_currencyRatios.ContainsKey(currencyName)) 
+            return (0, "No data");
+
+        var divineRatio = GetRatioOrDefault(currencyName, "Divine Orb");
+        var exaltedRatio = GetRatioOrDefault(currencyName, "Exalted Orb"); 
+        var chaosRatio = GetRatioOrDefault(currencyName, "Chaos Orb");
+
+        if (divineRatio <= 0 || exaltedRatio <= 0 || chaosRatio <= 0 || 
+            _divExRate <= 0 || _chaosDivRate <= 0)
+            return (0, "No data");
+
+        var (profit, buyCurrency) = GetBestProfitCurrency(divineRatio, exaltedRatio, chaosRatio);
+        return profit < 1 ? (0, "No profit") : ((int)profit, buyCurrency);
     }
 
     public override void AreaChange(AreaInstance area)
@@ -44,6 +201,35 @@ public class MarketWizard : BaseSettingsPlugin<MarketWizardSettings>
 
         if (panel is { WantedItemType: { } wantedItemType, OfferedItemType: { } offeredItemType })
         {
+            var firstOffer = panel?.OfferedItemStock?
+                .FirstOrDefault(x => x != null && x.Give != 0 && x.Get != 0);
+
+            float? firstOfferedRatio = null;
+            if (firstOffer != null && firstOffer.Give > 0)
+            {
+                firstOfferedRatio = firstOffer.Get / (float)firstOffer.Give;
+            }
+            
+            if (firstOfferedRatio.HasValue)
+            {
+                UpdateCurrencyRates(wantedItemType, offeredItemType, firstOfferedRatio.Value);
+                
+                if (wantedItemType.BaseName != "Divine Orb" && wantedItemType.BaseName != "Exalted Orb")
+                {
+                    if (offeredItemType.BaseName == "Divine Orb" || offeredItemType.BaseName == "Exalted Orb")
+                    {
+                        UpdateItemPrice(wantedItemType, offeredItemType, firstOfferedRatio.Value);
+                    }
+                }
+            }
+
+            if (firstOffer != null && firstOffer.Give > 0)
+            {
+                float ratio = firstOffer.Get / (float)firstOffer.Give;
+                int volume = firstOffer.ListedCount;
+                UpdateCurrencyRatio(wantedItemType, offeredItemType, ratio, volume);
+            }
+
             if (ImGui.Begin("StockWindow"))
             {
                 var offeredStock = panel.OfferedItemStock.Select(x => (x.Give, x.Get, Ratio: x.Get / (float)x.Give, ListedCount: x.ListedCount * x.Give / (float)x.Get))
@@ -276,6 +462,149 @@ public class MarketWizard : BaseSettingsPlugin<MarketWizardSettings>
                 }}");
             }
         }
+
+        DrawCurrencyInfo();
+    }
+
+    private void DrawCurrencyInfo()
+    {
+        if (!Settings.EnableProfitPanel || !_currencyRatios.Any()) 
+            return;
+
+        ImGuiWindowFlags windowFlags = 
+            ImGuiWindowFlags.NoScrollWithMouse | 
+            ImGuiWindowFlags.NoScrollbar;
+
+        var initialSize = new Vector2(600, 400);
+        ImGui.SetNextWindowSize(initialSize, ImGuiCond.FirstUseEver);
+        ImGui.SetNextWindowSizeConstraints(new Vector2(400, 200), new Vector2(float.MaxValue, float.MaxValue));
+
+        if (ImGui.Begin("Currency Exchange Profits", windowFlags))
+        {
+            if (ImGui.Button("Clear Cache"))
+            {
+                ClearCache();
+            }
+            ImGui.SameLine();
+
+            if (ImGui.Button(_showDivineInChaos ? "Show in Ex" : "Show in Chaos"))
+            {
+                _showDivineInChaos = !_showDivineInChaos;
+            }
+            ImGui.SameLine();
+            
+            // Define colors
+            var warningColor = new Vector4(1.0f, 1.0f, 0.0f, 1.0f); // Yellow
+            var validColor = new Vector4(0.498f, 0.788f, 0.576f, 1.0f); // #7fc993
+
+            // Divine/Ex rate display
+            ImGui.TextColored(
+                _divExRate <= 0 ? warningColor : validColor,
+                $"Divine/Ex rate: {(_divExRate <= 0 ? "Unknown" : _divExRate.ToString("F2"))}");
+            
+            ImGui.SameLine();
+            ImGui.Text("|");
+            ImGui.SameLine();
+
+            // Divine/Chaos rate display
+            ImGui.TextColored(
+                _chaosDivRate <= 0 ? warningColor : validColor,
+                $"Divine/Chaos rate: {(_chaosDivRate <= 0 ? "Unknown" : _chaosDivRate.ToString("F2"))}");
+
+            ImGui.Separator();
+
+            var tableFlags = ImGuiTableFlags.Resizable | 
+                            ImGuiTableFlags.Reorderable | 
+                            ImGuiTableFlags.Hideable | 
+                            ImGuiTableFlags.Sortable | 
+                            ImGuiTableFlags.BordersV |
+                            ImGuiTableFlags.ScrollY;
+
+            float tableHeight = ImGui.GetContentRegionAvail().Y;
+
+            if (ImGui.BeginTable("CurrencyRatios", 5, tableFlags, new Vector2(0, tableHeight)))
+            {
+                ImGui.TableSetupScrollFreeze(0, 1);
+                ImGui.TableSetupColumn("Currency\nName", ImGuiTableColumnFlags.DefaultSort);
+                ImGui.TableSetupColumn("Divine\nRate");
+                ImGui.TableSetupColumn("Exalted\nRate");
+                ImGui.TableSetupColumn("Chaos\nRate");
+                ImGui.TableSetupColumn("Profit");
+                ImGui.TableHeadersRow();
+
+                foreach (var currency in _currencyRatios.Keys
+                    .Where(k => k != "Divine Orb" && k != "Exalted Orb" && k != "Chaos Orb")
+                    .OrderByDescending(k => CalculateCurrencyProfit(k).profitAmount))
+                {
+                    var divineRatio = _currencyRatios[currency].GetValueOrDefault("Divine Orb")?.Ratio ?? 0;
+                    var exaltedRatio = _currencyRatios[currency].GetValueOrDefault("Exalted Orb")?.Ratio ?? 0;
+                    var chaosRatio = _currencyRatios[currency].GetValueOrDefault("Chaos Orb")?.Ratio ?? 0;
+
+                    if (divineRatio <= 0 && exaltedRatio <= 0 && chaosRatio <= 0) continue;
+
+                    ImGui.TableNextRow();
+                    
+                    ImGui.TableNextColumn();
+                    ImGui.TextWrapped(currency);
+
+                    ImGui.TableNextColumn();
+                    DisplayCurrencyRate(currency, divineRatio);
+
+                    ImGui.TableNextColumn();
+                    if (exaltedRatio > 0)
+                    {
+                        var divineEquiv = exaltedRatio / _divExRate;
+                        ImGui.Text($"1:{exaltedRatio:F1}\n(1:{divineEquiv:F1} div)");
+                    }
+                    else
+                    {
+                        ImGui.Text("-");
+                    }
+
+                    ImGui.TableNextColumn();
+                    if (chaosRatio > 0)
+                    {
+                        var divineEquiv = chaosRatio / _chaosDivRate;
+                        ImGui.Text($"1:{chaosRatio:F1}\n(1:{divineEquiv:F1} div)");
+                    }
+                    else
+                    {
+                        ImGui.Text("-");
+                    }
+
+                    ImGui.TableNextColumn();
+                    var (profit, buyCurrency) = CalculateCurrencyProfit(currency);
+                    if (profit > 0)
+                    {
+                        var color = profit > 5 ? Color.LightGreen : Color.White;
+                        ImGui.TextColored(color.ToImguiVec4(), $"{profit}ex\nBuy with {buyCurrency}");
+                    }
+                    else
+                    {
+                        ImGui.TextColored(Color.Gray.ToImguiVec4(), "No profit");
+                    }
+                }
+
+                ImGui.EndTable();
+            }
+            ImGui.End();
+        }
+    }
+
+    private void ClearCache()
+    {
+        var tempDivExRate = _divExRate;
+        var tempLastDivExRate = _lastDivExRate;
+        var tempChaosDivRate = _chaosDivRate;
+        var tempLastChaosDivRate = _lastChaosDivRate;
+
+        _currencyRatios.Clear();
+        _itemPrices.Clear();
+
+        _divExRate = tempDivExRate;
+        _lastDivExRate = tempLastDivExRate;
+        _chaosDivRate = tempChaosDivRate;
+        _lastChaosDivRate = tempLastChaosDivRate;
     }
 
     private void DrawTextMiddle(ImDrawListPtr drawList, string text, Vector2 position)
@@ -283,6 +612,43 @@ public class MarketWizard : BaseSettingsPlugin<MarketWizardSettings>
         var textSizeX = ImGui.CalcTextSize(text).X;
         drawList.AddText(position - new Vector2(textSizeX / 2, 0), Color.White.ToImgui(), text);
     }
+
+    private void DisplayCurrencyRate(string currency, double ratio, string prefix = "")
+    {
+        if (ratio <= 0)
+        {
+            ImGui.Text("-");
+            return;
+        }
+
+        var (convRate, label) = _showDivineInChaos 
+            ? (_chaosDivRate, "c")
+            : (_divExRate, "ex");
+
+        var convertedEquiv = ratio * convRate;
+        
+        ImGui.Text($"{prefix}1:{ratio:F1}");
+        ImGui.Text($"(1:{convertedEquiv:F1} {label})");
+    }
+
+    private (double profit, string currency) GetBestProfitCurrency(double divinePrice, double exaltedPrice, double chaosPrice)
+    {
+        var prices = new[]
+        {
+            ("Divine", divinePrice),
+            ("Exalted", exaltedPrice / _divExRate),
+            ("Chaos", chaosPrice / _chaosDivRate)
+        };
+
+        var min = prices.MinBy(x => x.Item2);
+        var max = prices.MaxBy(x => x.Item2);
+        
+        var profit = (max.Item2 - min.Item2) * _divExRate;
+        return profit > 0 ? (profit, min.Item1) : (0, "Equal");
+    }
+
+    private double GetRatioOrDefault(string currency, string target) =>
+        _currencyRatios.GetValueOrDefault(currency)?.GetValueOrDefault(target)?.Ratio ?? 0;
 }
 
 public static class Extensions
