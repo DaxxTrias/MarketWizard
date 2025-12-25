@@ -170,7 +170,32 @@ public class MarketWizard : BaseSettingsPlugin<MarketWizardSettings>
         var exaltedRatio = GetRatioOrDefault(currencyName, "Exalted Orb"); 
         var chaosRatio = GetRatioOrDefault(currencyName, "Chaos Orb");
 
-        // Count how many rates we have
+        // Derive missing rates from base exchange rates if possible
+        // If we have Exalted rate but not Divine, derive it
+        if (exaltedRatio > 0 && divineRatio <= 0 && _divExRate > 0)
+        {
+            divineRatio = exaltedRatio / _divExRate;
+        }
+        
+        // If we have Divine rate but not Exalted, derive it
+        if (divineRatio > 0 && exaltedRatio <= 0 && _divExRate > 0)
+        {
+            exaltedRatio = divineRatio * _divExRate;
+        }
+        
+        // If we have Divine rate but not Chaos, derive it
+        if (divineRatio > 0 && chaosRatio <= 0 && _chaosDivRate > 0)
+        {
+            chaosRatio = divineRatio * _chaosDivRate;
+        }
+        
+        // If we have Chaos rate but not Divine, derive it
+        if (chaosRatio > 0 && divineRatio <= 0 && _chaosDivRate > 0)
+        {
+            divineRatio = chaosRatio / _chaosDivRate;
+        }
+
+        // Count how many rates we have (including derived)
         int availableRates = 0;
         if (divineRatio > 0) availableRates++;
         if (exaltedRatio > 0) availableRates++;
@@ -178,7 +203,7 @@ public class MarketWizard : BaseSettingsPlugin<MarketWizardSettings>
 
         // Need at least 2 rates to compare
         if (availableRates < 2)
-            return (0, "Need 2+ rates");
+            return (0, "Need base rates");
 
         var (profit, buyCurrency) = GetBestProfitCurrency(divineRatio, exaltedRatio, chaosRatio);
         return profit < 1 ? (0, "No profit") : ((int)profit, buyCurrency);
@@ -532,6 +557,8 @@ public class MarketWizard : BaseSettingsPlugin<MarketWizardSettings>
             {
                 ImGui.TextColored(new Vector4(0.7f, 0.9f, 1.0f, 1.0f), 
                     "Profit shows which base currency offers the best rate to buy each item.");
+                ImGui.TextColored(new Vector4(0.6f, 0.7f, 0.8f, 1.0f), 
+                    "Rates with ~ prefix are calculated from base exchange rates.");
                 ImGui.Spacing();
             }
 
@@ -564,8 +591,22 @@ public class MarketWizard : BaseSettingsPlugin<MarketWizardSettings>
                     var divineRatio = _currencyRatios[currency].GetValueOrDefault("Divine Orb")?.Ratio ?? 0;
                     var exaltedRatio = _currencyRatios[currency].GetValueOrDefault("Exalted Orb")?.Ratio ?? 0;
                     var chaosRatio = _currencyRatios[currency].GetValueOrDefault("Chaos Orb")?.Ratio ?? 0;
+                    
+                    var hasDivine = divineRatio > 0;
+                    var hasExalted = exaltedRatio > 0;
+                    var hasChaos = chaosRatio > 0;
 
-                    // Skip if no rates at all
+                    // Derive missing rates for display
+                    if (exaltedRatio > 0 && divineRatio <= 0 && _divExRate > 0)
+                        divineRatio = exaltedRatio / _divExRate;
+                    if (divineRatio > 0 && exaltedRatio <= 0 && _divExRate > 0)
+                        exaltedRatio = divineRatio * _divExRate;
+                    if (divineRatio > 0 && chaosRatio <= 0 && _chaosDivRate > 0)
+                        chaosRatio = divineRatio * _chaosDivRate;
+                    if (chaosRatio > 0 && divineRatio <= 0 && _chaosDivRate > 0)
+                        divineRatio = chaosRatio / _chaosDivRate;
+
+                    // Skip if no rates at all (even after derivation)
                     if (divineRatio <= 0 && exaltedRatio <= 0 && chaosRatio <= 0) continue;
 
                     ImGui.TableNextRow();
@@ -576,7 +617,18 @@ public class MarketWizard : BaseSettingsPlugin<MarketWizardSettings>
                     ImGui.TableNextColumn();
                     if (divineRatio > 0)
                     {
-                        DisplayCurrencyRate(currency, divineRatio);
+                        if (hasDivine)
+                        {
+                            DisplayCurrencyRate(currency, divineRatio);
+                        }
+                        else
+                        {
+                            // Derived rate - show in gray/italics
+                            ImGui.TextColored(new Vector4(0.7f, 0.8f, 0.9f, 1.0f), $"~1:{divineRatio:F2}");
+                            var convertedEquiv = divineRatio * (_showDivineInChaos ? _chaosDivRate : _divExRate);
+                            var label = _showDivineInChaos ? "c" : "ex";
+                            ImGui.TextColored(new Vector4(0.6f, 0.7f, 0.8f, 1.0f), $"(~1:{convertedEquiv:F1} {label})");
+                        }
                     }
                     else
                     {
@@ -586,15 +638,14 @@ public class MarketWizard : BaseSettingsPlugin<MarketWizardSettings>
                     ImGui.TableNextColumn();
                     if (exaltedRatio > 0)
                     {
-                        ImGui.Text($"1:{exaltedRatio:F1}");
+                        var color = hasExalted ? new Vector4(1.0f, 1.0f, 1.0f, 1.0f) : new Vector4(0.7f, 0.8f, 0.9f, 1.0f);
+                        var prefix = hasExalted ? "" : "~";
+                        ImGui.TextColored(color, $"{prefix}1:{exaltedRatio:F1}");
                         if (_divExRate > 0)
                         {
                             var divineEquiv = exaltedRatio / _divExRate;
-                            ImGui.Text($"(1:{divineEquiv:F1} div)");
-                        }
-                        else
-                        {
-                            ImGui.TextColored(new Vector4(0.7f, 0.7f, 0.7f, 1.0f), "(no div rate)");
+                            var eqColor = hasExalted ? new Vector4(0.8f, 0.8f, 0.8f, 1.0f) : new Vector4(0.6f, 0.7f, 0.8f, 1.0f);
+                            ImGui.TextColored(eqColor, $"({prefix}1:{divineEquiv:F1} div)");
                         }
                     }
                     else
@@ -605,15 +656,14 @@ public class MarketWizard : BaseSettingsPlugin<MarketWizardSettings>
                     ImGui.TableNextColumn();
                     if (chaosRatio > 0)
                     {
-                        ImGui.Text($"1:{chaosRatio:F1}");
+                        var color = hasChaos ? new Vector4(1.0f, 1.0f, 1.0f, 1.0f) : new Vector4(0.7f, 0.8f, 0.9f, 1.0f);
+                        var prefix = hasChaos ? "" : "~";
+                        ImGui.TextColored(color, $"{prefix}1:{chaosRatio:F1}");
                         if (_chaosDivRate > 0)
                         {
                             var divineEquiv = chaosRatio / _chaosDivRate;
-                            ImGui.Text($"(1:{divineEquiv:F1} div)");
-                        }
-                        else
-                        {
-                            ImGui.TextColored(new Vector4(0.7f, 0.7f, 0.7f, 1.0f), "(no div rate)");
+                            var eqColor = hasChaos ? new Vector4(0.8f, 0.8f, 0.8f, 1.0f) : new Vector4(0.6f, 0.7f, 0.8f, 1.0f);
+                            ImGui.TextColored(eqColor, $"({prefix}1:{divineEquiv:F1} div)");
                         }
                     }
                     else
